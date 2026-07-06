@@ -1,20 +1,22 @@
-"""HTML 報告輸出：把 state/scored 資料轉成單一檔案、可離線開啟的互動卡片頁。
+"""HTML 報告輸出：single-file static HTML（GitHub Pages 直接可開）。
 
-特色：
-- 純靜態單檔（inline CSS/JS），瀏覽器直接開啟即可
-- 預設只顯示 availability_status == "active" 的物件（hideUnavailable = true）
-- 預設隱藏重複刊登（is_duplicate）
+架構：
+- 只輸出一個 HTML 檔：CSS inline 於 <style>、JS inline 於 <script>
+- listings 資料以 JSON 嵌在 <script id="listings-data" type="application/json">
+- 卡片由前端 JS 從嵌入的 JSON 渲染（不 fetch 任何本機 JSON、不依賴
+  localhost 或 backend server），手機 Safari / Chrome 可直接開啟
+- 預設只顯示 availability_status == "active" 且隱藏重複刊登
 - 篩選 chips：有效/下架、本輪新物件、狀態變更、車位型式、2-3 房、
-  屋主直租、費用已確認、總月付上限
-- 非 active 卡片變灰，且不顯示「優先約看」
-- 標題與卡片可連到 591 物件頁（https://rent.591.com.tw/{listing_id}）
+  屋主直租、費用已確認、總月付上限；非 active 卡片變灰、不顯示「優先約看」
 """
 from __future__ import annotations
 
 import html
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
+from typing import Any, Optional
 
 import pandas as pd
 
@@ -25,9 +27,6 @@ logger = logging.getLogger(__name__)
 
 LISTING_URL_BASE = "https://rent.591.com.tw"
 
-PARKING_LABELS = {"flat": "平面車位", "mechanical": "機械車位", "unknown": "車位(型式未確認)", "none": "無車位"}
-PRIORITY_CLASSES = {"優先約看": "p-top", "可備選": "p-backup", "先跳過": "p-skip"}
-CONFIDENCE_LABELS = {"high": "費用已確認", "medium": "一項費用未知", "low": "費用不完整"}
 AVAILABILITY_LABELS = {
     "active": "有效", "rented": "已出租", "removed": "已下架", "expired": "已過期",
     "blocked": "被阻擋", "error": "錯誤", "unknown": "未知",
@@ -42,6 +41,25 @@ SORT_OPTIONS = [
 ]
 
 COST_CAP_OPTIONS = ["28000", "30000", "33000", "36000"]
+
+# 嵌入 JSON 的欄位（前端卡片渲染所需的全部資料）
+_STR_FIELDS = [
+    "listing_id", "title", "community_name", "address", "layout", "floor",
+    "parking_type", "life_circle_guess", "agent_type", "deposit", "description",
+    "distance_to_taiyuan_note", "posted_time", "priority", "cost_confidence",
+    "availability_status", "first_seen_at", "last_checked_at", "status_change_note",
+    "furniture_appliances",
+]
+_NUM_FIELDS = [
+    "price", "management_fee", "parking_fee", "total_monthly_cost",
+    "size_ping", "total_floors", "score", "rooms",
+]
+_BOOL_FIELDS = [
+    "has_parking", "owner_direct", "has_elevator", "can_cook", "available_now",
+    "can_tax_report", "can_register_household", "parking_included_in_rent",
+    "seen_in_list_page_this_run", "status_changed", "new_this_run",
+    "is_duplicate", "hard_pass",
+]
 
 
 def _resolve(path: str | Path) -> Path:
@@ -61,193 +79,23 @@ def _missing(value) -> bool:
     return value is None or (isinstance(value, float) and pd.isna(value)) or str(value) in ("", "nan", "None")
 
 
-def _text(value, fallback: str = "—") -> str:
-    return fallback if _missing(value) else html.escape(str(value))
+def _clean_str(value) -> Optional[str]:
+    return None if _missing(value) else str(value)
 
 
-def _money(value, fallback: str = "—") -> str:
-    num = to_number(value)
-    return fallback if num is None else f"{num:,.0f}"
-
-
-def _bool_attr(value, default: bool = False) -> str:
-    b = to_bool(value)
-    return "true" if (default if b is None else b) else "false"
-
-
-def _dt_short(value) -> str:
-    """'2026-07-06 01:18:58' -> '2026-07-06 01:18'"""
-    if _missing(value):
-        return "—"
-    text = str(value)
-    return html.escape(text[:16] if len(text) >= 16 else text)
-
-
-def _availability(row: dict) -> str:
-    status = str(row.get("availability_status") or "").strip().lower()
-    return status if status in AVAILABILITY_LABELS else "active"
-
-
-def _feature_badges(row: dict) -> str:
-    """條件徽章：只顯示為 True 的正面條件，未知不顯示。"""
-    features = [
-        ("has_elevator", "電梯"),
-        ("can_cook", "可開伙"),
-        ("available_now", "即可入住"),
-        ("owner_direct", "屋主直租"),
-        ("can_tax_report", "可報稅"),
-        ("can_register_household", "可遷戶籍"),
-        ("parking_included_in_rent", "租金含車位"),
-    ]
-    tags = [f'<span class="tag">{label}</span>' for key, label in features if to_bool(row.get(key)) is True]
-    if not _missing(row.get("furniture_appliances")):
-        tags.append('<span class="tag">附家具家電</span>')
-    return "".join(tags)
-
-
-def _cost_breakdown(row: dict) -> str:
-    parts = [f"租金 {_money(row.get('price'), '?')}"]
-    mgmt = to_number(row.get("management_fee"))
-    if mgmt is None:
-        parts.append("管理費 ?")
-    elif mgmt > 0:
-        parts.append(f"管理費 {mgmt:,.0f}")
-    if to_bool(row.get("has_parking")):
-        park = to_number(row.get("parking_fee"))
-        if park is None:
-            parts.append("車位費 ?")
-        elif park > 0:
-            parts.append(f"車位費 {park:,.0f}")
-    return " + ".join(parts)
-
-
-def _status_strip(row: dict, availability: str) -> str:
-    """卡片上的存活狀態列：狀態 / 本輪看到 / 檢查時間 / 狀態變更。"""
-    label = AVAILABILITY_LABELS.get(availability, availability)
-    seen = to_bool(row.get("seen_in_list_page_this_run"))
-    seen_text = "—" if seen is None else ("是" if seen else "否")
-    bits = [
-        f'<span class="avail avail-{availability}">狀態：{label}</span>',
-        f"<span>本輪看到：{seen_text}</span>",
-        f"<span>最後檢查：{_dt_short(row.get('last_checked_at'))}</span>",
-        f"<span>第一次看到：{_dt_short(row.get('first_seen_at'))}</span>",
-    ]
-    note = row.get("status_change_note")
-    if not _missing(note) and to_bool(row.get("status_changed")):
-        bits.append(f'<span class="change-note">狀態變更：{html.escape(str(note))}</span>')
-    if to_bool(row.get("is_duplicate")):
-        bits.append('<span class="dup-note">疑似重複刊登</span>')
-    if to_bool(row.get("new_this_run")):
-        bits.append('<span class="new-note">本輪新物件</span>')
-    return f'<div class="status-strip">{"".join(bits)}</div>'
-
-
-def _card_html(row: dict) -> str:
-    url = listing_url(row)
-    availability = _availability(row)
-    is_active = availability == "active"
-
-    # 非 active 一律不可顯示「優先約看」，卡片以狀態標籤取代 priority 徽章
-    priority = str(row.get("priority") or "")
-    if not is_active:
-        priority = "先跳過"
-    p_class = PRIORITY_CLASSES.get(priority, "p-skip")
-    badge_html = (
-        f'<span class="badge {p_class}">{_text(priority, "未分級")}</span>' if is_active
-        else f'<span class="badge b-unavail">{AVAILABILITY_LABELS.get(availability, availability)}</span>'
-    )
-
-    score = to_number(row.get("score")) or 0
-    life_circle = str(row.get("life_circle_guess") or "其他")
-    cost = to_number(row.get("total_monthly_cost"))
-    confidence = str(row.get("cost_confidence") or "")
-    rooms = to_number(row.get("rooms"))
-
-    cost_class = ""
-    if is_active and cost is not None:
-        cost_class = "cost-good" if cost <= 36000 else ("cost-bad" if cost > 38000 else "")
-
-    search_blob = html.escape(
-        " ".join(
-            str(row.get(k) or "")
-            for k in ("title", "address", "community_name", "life_circle_guess", "layout", "description")
-        ).lower()
-    )
-
-    meta_items = [
-        ("格局", _text(row.get("layout"))),
-        ("坪數", f"{_money(row.get('size_ping'))} 坪" if not _missing(row.get("size_ping")) else "—"),
-        ("樓層", (f"{_text(row.get('floor'))}F/{_money(row.get('total_floors'))}F"
-                  if not _missing(row.get("floor")) and not _missing(row.get("total_floors")) else _text(row.get("floor")))),
-        ("社區", _text(row.get("community_name"))),
-        ("地址", _text(row.get("address"))),
-        ("車位", _text(PARKING_LABELS.get(str(row.get("parking_type")), row.get("parking_type")))),
-        ("刊登者", _text(row.get("agent_type"))),
-        ("押金", _text(row.get("deposit"))),
-    ]
-    meta_html = "".join(
-        f'<div class="meta-item"><span class="meta-label">{label}</span><span class="meta-value">{value}</span></div>'
-        for label, value in meta_items
-    )
-
-    desc = str(row.get("description") or "").strip()
-    desc_html = f'<p class="desc">{html.escape(desc[:160])}{"…" if len(desc) > 160 else ""}</p>' if desc else ""
-
-    distance = _text(row.get("distance_to_taiyuan_note"), "")
-    posted = _text(row.get("posted_time"), "")
-    footer_bits = [b for b in (distance, f"刊登：{posted}" if posted else "", f"ID {_text(row.get('listing_id'))}") if b]
-
-    conf_label = CONFIDENCE_LABELS.get(confidence, "")
-    conf_html = f'<span class="conf conf-{html.escape(confidence)}">{conf_label}</span>' if conf_label else ""
-
-    pct = max(0, min(100, float(score)))
-    title = _text(row.get("title"), "(無標題)")
-    title_html = (
-        f'<a href="{html.escape(url)}" target="_blank" rel="noopener">{title}</a>' if url else title
-    )
-    open_btn = (
-        f'<a class="open-btn" href="{html.escape(url)}" target="_blank" rel="noopener">在 591 開啟 ↗</a>' if url else ""
-    )
-
-    data_attrs = " ".join([
-        f'data-priority="{html.escape(priority)}"',
-        f'data-circle="{html.escape(life_circle)}"',
-        f'data-search="{search_blob}"',
-        f'data-score="{score}"',
-        f'data-cost="{cost if cost is not None else 999999999}"',
-        f'data-price="{to_number(row.get("price")) or 999999999}"',
-        f'data-size="{to_number(row.get("size_ping")) or 0}"',
-        f'data-availability="{availability}"',
-        f'data-seen-this-run="{_bool_attr(row.get("seen_in_list_page_this_run"), default=True)}"',
-        f'data-status-changed="{_bool_attr(row.get("status_changed"))}"',
-        f'data-new-this-run="{_bool_attr(row.get("new_this_run"))}"',
-        f'data-parking="{html.escape(str(row.get("parking_type") or "none"))}"',
-        f'data-rooms="{int(rooms) if rooms is not None else ""}"',
-        f'data-owner-direct="{_bool_attr(row.get("owner_direct"))}"',
-        f'data-cost-confidence="{html.escape(confidence or "low")}"',
-        f'data-duplicate="{_bool_attr(row.get("is_duplicate"))}"',
-        f'data-total-cost="{int(cost) if cost is not None else ""}"',
-        f'data-hard-pass="{_bool_attr(row.get("hard_pass"))}"',
-    ])
-
-    unavail_class = "" if is_active else " unavail"
-    return f"""<article class="listing {p_class}-border{unavail_class}" {data_attrs}>
-  {_status_strip(row, availability)}
-  <div class="listing-head">
-    {badge_html}
-    <span class="circle-chip">{html.escape(life_circle)}</span>
-    <div class="score-ring" style="--pct:{pct}"><span>{score:g}</span></div>
-  </div>
-  <h2 class="listing-title">{title_html}</h2>
-  <div class="price-row {cost_class}">
-    <span class="price-main">{_money(cost, "月付 ?")}</span><span class="price-unit">元/月</span>{conf_html}
-    <div class="price-breakdown">{html.escape(_cost_breakdown(row))}</div>
-  </div>
-  <div class="meta-grid">{meta_html}</div>
-  <div class="tags">{_feature_badges(row)}</div>
-  {desc_html}
-  <div class="listing-footer"><span>{html.escape("　·　".join(footer_bits))}</span>{open_btn}</div>
-</article>"""
+def _listing_record(row: dict) -> dict[str, Any]:
+    """把一筆資料整理成乾淨的 JSON record（無 NaN、型別正確）。"""
+    record: dict[str, Any] = {}
+    for key in _STR_FIELDS:
+        record[key] = _clean_str(row.get(key))
+    for key in _NUM_FIELDS:
+        record[key] = to_number(row.get(key))
+    for key in _BOOL_FIELDS:
+        record[key] = to_bool(row.get(key))
+    record["url"] = listing_url(row)
+    status = (record.get("availability_status") or "active").lower()
+    record["availability_status"] = status if status in AVAILABILITY_LABELS else "active"
+    return record
 
 
 def _col(df: pd.DataFrame, name: str) -> pd.Series:
@@ -310,11 +158,14 @@ def _filter_buttons(df: pd.DataFrame) -> tuple[str, str]:
 
 
 def render_html_report(df: pd.DataFrame, title: str = "591 竹北租屋報告") -> str:
-    """把 DataFrame 渲染成完整 HTML 字串（卡片版面，預設只顯示 active）。"""
+    """把 DataFrame 渲染成 single-file HTML 字串（資料嵌入 JSON、前端渲染卡片）。"""
     if "score" in df.columns:
         df = df.sort_values("score", ascending=False, na_position="last").reset_index(drop=True)
 
-    cards = "\n".join(_card_html(row) for row in df.to_dict(orient="records"))
+    records = [_listing_record(row) for row in df.to_dict(orient="records")]
+    # </ 逸出成 <\/：避免資料裡出現 </script> 提前關閉 script tag
+    data_json = json.dumps(records, ensure_ascii=False).replace("</", "<\\/")
+
     priority_chips, circle_chips = _filter_buttons(df)
     sort_options = "".join(
         f'<option value="{key}" data-attr="{attr}" data-dir="{direction}">{label}</option>'
@@ -512,21 +363,172 @@ footer.page {{ color: var(--muted); font-size: 12px; margin-top: 20px; text-alig
     <div class="group"><input id="search" type="search" placeholder="搜尋標題 / 地址 / 社區 / 描述…"></div>
     <span id="count"></span>
   </div>
-  <div class="grid" id="grid">
-{cards}
-  </div>
+  <div class="grid" id="grid"></div>
   <footer class="page">點擊標題或「在 591 開啟」按鈕可前往 591 物件頁　·　報告產生時間：{generated}　·　由 591parser 產生，僅供個人找房參考</footer>
 </main>
+<script id="listings-data" type="application/json">{data_json}</script>
 <script>
 (function () {{
+  "use strict";
+  var LISTINGS = JSON.parse(document.getElementById("listings-data").textContent);
+
+  var AVAIL_LABELS = {{ active: "有效", rented: "已出租", removed: "已下架", expired: "已過期",
+                       blocked: "被阻擋", error: "錯誤", unknown: "未知" }};
+  var PARKING_LABELS = {{ flat: "平面車位", mechanical: "機械車位", unknown: "車位(型式未確認)", none: "無車位" }};
+  var PRIORITY_CLASSES = {{ "優先約看": "p-top", "可備選": "p-backup", "先跳過": "p-skip" }};
+  var CONF_LABELS = {{ high: "費用已確認", medium: "一項費用未知", low: "費用不完整" }};
+  var FEATURES = [
+    ["has_elevator", "電梯"], ["can_cook", "可開伙"], ["available_now", "即可入住"],
+    ["owner_direct", "屋主直租"], ["can_tax_report", "可報稅"],
+    ["can_register_household", "可遷戶籍"], ["parking_included_in_rent", "租金含車位"]
+  ];
+
+  function esc(value) {{
+    return String(value == null ? "" : value)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }}
+  function money(value, fallback) {{
+    if (value == null || isNaN(value)) return fallback || "—";
+    return Math.round(value).toLocaleString("en-US");
+  }}
+  function text(value, fallback) {{ return (value == null || value === "") ? (fallback || "—") : esc(value); }}
+  function dtShort(value) {{ return value ? esc(String(value).slice(0, 16)) : "—"; }}
+
+  function costBreakdown(l) {{
+    var parts = ["租金 " + money(l.price, "?")];
+    if (l.management_fee == null) parts.push("管理費 ?");
+    else if (l.management_fee > 0) parts.push("管理費 " + money(l.management_fee));
+    if (l.has_parking) {{
+      if (l.parking_fee == null) parts.push("車位費 ?");
+      else if (l.parking_fee > 0) parts.push("車位費 " + money(l.parking_fee));
+    }}
+    return parts.join(" + ");
+  }}
+
+  function statusStrip(l, avail) {{
+    var seen = l.seen_in_list_page_this_run;
+    var bits = [
+      '<span class="avail avail-' + avail + '">狀態：' + AVAIL_LABELS[avail] + "</span>",
+      "<span>本輪看到：" + (seen == null ? "—" : (seen ? "是" : "否")) + "</span>",
+      "<span>最後檢查：" + dtShort(l.last_checked_at) + "</span>",
+      "<span>第一次看到：" + dtShort(l.first_seen_at) + "</span>"
+    ];
+    if (l.status_changed && l.status_change_note)
+      bits.push('<span class="change-note">狀態變更：' + esc(l.status_change_note) + "</span>");
+    if (l.is_duplicate) bits.push('<span class="dup-note">疑似重複刊登</span>');
+    if (l.new_this_run) bits.push('<span class="new-note">本輪新物件</span>');
+    return '<div class="status-strip">' + bits.join("") + "</div>";
+  }}
+
+  function buildCard(l) {{
+    var avail = l.availability_status || "active";
+    var isActive = avail === "active";
+    // 非 active 一律不可顯示「優先約看」
+    var priority = isActive ? (l.priority || "") : "先跳過";
+    var pClass = PRIORITY_CLASSES[priority] || "p-skip";
+    var badge = isActive
+      ? '<span class="badge ' + pClass + '">' + text(priority, "未分級") + "</span>"
+      : '<span class="badge b-unavail">' + AVAIL_LABELS[avail] + "</span>";
+
+    var score = l.score == null ? 0 : l.score;
+    var cost = l.total_monthly_cost;
+    var costClass = "";
+    if (isActive && cost != null) costClass = cost <= 36000 ? "cost-good" : (cost > 38000 ? "cost-bad" : "");
+    var conf = l.cost_confidence || "";
+    var confHtml = CONF_LABELS[conf]
+      ? '<span class="conf conf-' + esc(conf) + '">' + CONF_LABELS[conf] + "</span>" : "";
+
+    var floorText = (l.floor != null && l.total_floors != null)
+      ? text(l.floor) + "F/" + money(l.total_floors) + "F" : text(l.floor);
+    var meta = [
+      ["格局", text(l.layout)],
+      ["坪數", l.size_ping != null ? money(l.size_ping) + " 坪" : "—"],
+      ["樓層", floorText],
+      ["社區", text(l.community_name)],
+      ["地址", text(l.address)],
+      ["車位", text(PARKING_LABELS[l.parking_type] || l.parking_type)],
+      ["刊登者", text(l.agent_type)],
+      ["押金", text(l.deposit)]
+    ].map(function (kv) {{
+      return '<div class="meta-item"><span class="meta-label">' + kv[0] +
+             '</span><span class="meta-value">' + kv[1] + "</span></div>";
+    }}).join("");
+
+    var tags = FEATURES.filter(function (f) {{ return l[f[0]] === true; }})
+      .map(function (f) {{ return '<span class="tag">' + f[1] + "</span>"; }});
+    if (l.furniture_appliances) tags.push('<span class="tag">附家具家電</span>');
+
+    var desc = (l.description || "").trim();
+    var descHtml = desc
+      ? '<p class="desc">' + esc(desc.slice(0, 160)) + (desc.length > 160 ? "…" : "") + "</p>" : "";
+
+    var footerBits = [];
+    if (l.distance_to_taiyuan_note) footerBits.push(esc(l.distance_to_taiyuan_note));
+    if (l.posted_time) footerBits.push("刊登：" + esc(l.posted_time));
+    footerBits.push("ID " + text(l.listing_id));
+
+    var url = l.url || "";
+    var title = text(l.title, "(無標題)");
+    var titleHtml = url
+      ? '<a href="' + esc(url) + '" target="_blank" rel="noopener">' + title + "</a>" : title;
+    var openBtn = url
+      ? '<a class="open-btn" href="' + esc(url) + '" target="_blank" rel="noopener">在 591 開啟 ↗</a>' : "";
+
+    var el = document.createElement("article");
+    el.className = "listing " + pClass + "-border" + (isActive ? "" : " unavail");
+    var d = el.dataset;
+    d.priority = priority;
+    d.circle = l.life_circle_guess || "其他";
+    d.search = [l.title, l.address, l.community_name, l.life_circle_guess, l.layout, l.description]
+      .map(function (v) {{ return v || ""; }}).join(" ").toLowerCase();
+    d.score = score;
+    d.cost = cost != null ? cost : 999999999;
+    d.price = l.price != null ? l.price : 999999999;
+    d.size = l.size_ping != null ? l.size_ping : 0;
+    d.availability = avail;
+    d.seenThisRun = l.seen_in_list_page_this_run === false ? "false" : "true";
+    d.statusChanged = l.status_changed === true ? "true" : "false";
+    d.newThisRun = l.new_this_run === true ? "true" : "false";
+    d.parking = l.parking_type || "none";
+    d.rooms = l.rooms != null ? String(Math.round(l.rooms)) : "";
+    d.ownerDirect = l.owner_direct === true ? "true" : "false";
+    d.costConfidence = conf || "low";
+    d.duplicate = l.is_duplicate === true ? "true" : "false";
+    d.totalCost = cost != null ? String(Math.round(cost)) : "";
+    d.hardPass = l.hard_pass === true ? "true" : "false";
+
+    var pct = Math.max(0, Math.min(100, score));
+    el.innerHTML =
+      statusStrip(l, avail) +
+      '<div class="listing-head">' + badge +
+        '<span class="circle-chip">' + esc(d.circle) + "</span>" +
+        '<div class="score-ring" style="--pct:' + pct + '"><span>' + (Math.round(score * 10) / 10) + "</span></div>" +
+      "</div>" +
+      '<h2 class="listing-title">' + titleHtml + "</h2>" +
+      '<div class="price-row ' + costClass + '">' +
+        '<span class="price-main">' + money(cost, "月付 ?") + '</span><span class="price-unit">元/月</span>' + confHtml +
+        '<div class="price-breakdown">' + esc(costBreakdown(l)) + "</div>" +
+      "</div>" +
+      '<div class="meta-grid">' + meta + "</div>" +
+      '<div class="tags">' + tags.join("") + "</div>" +
+      descHtml +
+      '<div class="listing-footer"><span>' + footerBits.join("　·　") + "</span>" + openBtn + "</div>";
+    return el;
+  }}
+
+  var grid = document.getElementById("grid");
+  var frag = document.createDocumentFragment();
+  LISTINGS.forEach(function (l) {{ frag.appendChild(buildCard(l)); }});
+  grid.appendChild(frag);
+  var items = Array.prototype.slice.call(grid.children);
+
   // hideUnavailable = true：預設 availability 篩選為 "active"
   var state = {{
     priority: "", circle: "", q: "", availability: "active", costCap: null,
     newOnly: false, changedOnly: false, flatOnly: false, hideMech: false,
     rooms23: false, ownerOnly: false, confirmedOnly: false, hideDup: true
   }};
-  var grid = document.getElementById("grid");
-  var items = Array.prototype.slice.call(grid.children);
 
   function visible(el) {{
     var d = el.dataset;
