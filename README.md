@@ -106,14 +106,7 @@ https://<你的帳號>.github.io/591parser/
 排程（`scripts/scheduled_run.sh`，每天 08:00 / 20:00）跑完爬蟲後會**自動呼叫部署腳本**，
 手機用同一個網址重新整理就是最新報告。若尚未設定 git remote，部署會安靜跳過、不影響爬蟲。
 
-### 備用：Cloudflare quick tunnel（臨時網址，需本機開著）
-
-```bash
-./publish.sh            # 重新產生報告 + 開 tunnel（https://xxxx.trycloudflare.com）
-./publish.sh --no-regen # 直接發布既有報告
-```
-
-網址在腳本執行期間有效、每次啟動會換；適合臨時分享，長期請用 GitHub Pages。
+目前的固定網址：<https://agagagga.github.io/591parser/>（repo：`AgAgAggA/591parser`）。
 
 ## 排程自動更新
 
