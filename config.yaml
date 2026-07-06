@@ -1,0 +1,158 @@
+# 591 竹北租屋爬蟲設定檔
+# 所有打分權重與級距都可以在這裡調整，不需要改程式碼。
+
+crawl:
+  default_url: "https://rent.591.com.tw/list?kind=1&region=5&section=54"
+  max_pages: 30
+  # 詳細頁之間的隨機延遲秒數（請保持禮貌，不要調太低）
+  delay_min_seconds: 2.0
+  delay_max_seconds: 5.0
+  # 列表頁之間的隨機延遲秒數
+  list_delay_min_seconds: 3.0
+  list_delay_max_seconds: 6.0
+  page_timeout_ms: 30000
+  # retry policy：只有 timeout / network error 會重試；blocked/CAPTCHA 絕不重試
+  max_retries: 2
+  retry_delay_seconds: 5
+
+  # 多執行緒抓取：每個 worker 有自己的瀏覽器，佇列分工。
+  # 偵測到 blocked / CAPTCHA 時全部 worker 立即停止。
+  parallel_workers: 8
+  parallel_delay_min_seconds: 0.4   # 每個 worker 抓完一筆後的延遲
+  parallel_delay_max_seconds: 1.2
+
+  # 爬前預篩：列表頁卡片就明顯不符條件的物件，不進詳細頁（大幅縮短時間）。
+  # 只在「確定」不符時跳過；卡片上看不出來的（如車位）一律保留。
+  prefilter:
+    enabled: true
+    max_price: 32000      # 列表頁租金超過此值就跳過，不進詳細頁
+    skip_rooms_gte: 4     # 卡片已知房數 >= 4 就跳過
+    skip_suite: true      # 卡片文字含套房/雅房就跳過
+    skip_keywords:        # 卡片文字含以下關鍵字就跳過
+      - "樓中樓"
+
+# 生活圈關鍵字，由上而下依優先順序比對，第一個命中的生活圈就是結果
+life_circles:
+  - name: "台元"
+    keywords: ["台元", "台元科技園區", "福興一路", "台科", "博愛街"]
+  - name: "縣三"
+    keywords: ["縣三", "十興", "國賓大悅"]
+  - name: "遠百/勝利"
+    keywords: ["遠百", "勝利", "莊敬", "自強北路", "成功"]
+  - name: "高鐵/嘉豐"
+    keywords: ["高鐵", "六家", "嘉豐", "東興", "文興", "隘口", "喜來登"]
+  - name: "華興/市公所"
+    keywords: ["華興", "中正西路", "市公所", "新國", "文化中心"]
+
+scoring:
+  # 各分項滿分（總分 100）
+  weights:
+    location_score: 25
+    cost_score: 20
+    parking_score: 15
+    condition_score: 15
+    commute_score: 10
+    layout_score: 10
+    landlord_contract_score: 5
+
+  # 總月付成本級距 -> cost_score
+  cost_brackets:
+    - {max: 29000, score: 20}
+    - {max: 33000, score: 18}
+    - {max: 36000, score: 15}
+    - {max: 38000, score: 10}
+    - {max: null, score: 5}   # 超過 38000
+  cost_unknown_score: 8
+
+  # parking_type -> parking_score
+  parking_scores:
+    flat: 15
+    unknown: 9        # 有車位但型式未確認
+    mechanical: 6
+    none: 0
+
+  # rooms -> layout_score
+  layout_scores:
+    suite: 0          # 套房 / 雅房
+    rooms_1: 5
+    rooms_2: 10
+    rooms_3: 9
+    rooms_4_plus: 3
+    unknown: 4
+
+  # 生活圈 -> location_score（規格：台元/縣三/遠百勝利 22-25、高鐵 18-23、華興 14-20、其他 8-14）
+  location_scores:
+    "台元": 25
+    "縣三": 24
+    "遠百/勝利": 23
+    "高鐵/嘉豐": 20
+    "華興/市公所": 16
+    "其他": 10
+
+  # 生活圈 -> commute_score（到台元的通勤概念分）
+  commute_scores:
+    "台元": 10
+    "縣三": 9
+    "遠百/勝利": 8
+    "高鐵/嘉豐": 6
+    "華興/市公所": 5
+    "其他": 3
+
+  # condition_score 加分項（總和上限為 condition_score 滿分）
+  condition_points:
+    has_elevator: 5
+    can_cook: 4
+    has_furniture: 4
+    available_now: 2
+
+  # landlord_contract_score 加分項（總和上限為滿分）
+  landlord_points:
+    owner_direct: 2
+    can_register_household: 1.5
+    can_tax_report: 1.5
+
+  # priority 分級門檻
+  priority:
+    top: 80           # score >= 80 -> 優先約看
+    backup: 65        # 65-79 -> 可備選，其餘 -> 先跳過
+
+  # 全包超過這個金額標記低優先
+  low_priority_cost_threshold: 38000
+
+filter:
+  # filtered.csv 的條件（舊版 CSV 工具用）
+  allowed_rooms: [2, 3]
+  max_total_monthly_cost: 38000   # unknown 也保留
+  require_parking: true
+  exclude_suite: true
+
+# priority 的硬條件：不通過就不可能是「優先約看」（不能只看 score）
+# top_candidates.csv 也用這組條件（active + 以下全部）
+hard_filter:
+  allowed_rooms: [2, 3]
+  require_parking: true
+  exclude_suite: true
+  max_total_monthly_cost: 36000   # hard_pass / top_candidates 的月付上限
+  soft_max_cost: 38000            # 費用未知或略超時最多只能列「可備選」
+
+# 物件存活狀態的持久化 state
+state:
+  path: "data/listings_state.sqlite"
+  max_stale_checks: 200           # 每輪 stale check 上限
+  stop_on_blocked: true           # 遇到 blocked / CAPTCHA 立即停止
+
+output:
+  # GitHub Pages 發布目錄：報告會同步複製成 docs/index.html
+  pages_dir: "docs"
+  # state-based 輸出（主要流程）
+  all_current_csv: "output/zhubei_591_all_current.csv"
+  active_csv: "output/zhubei_591_active.csv"
+  unavailable_csv: "output/zhubei_591_unavailable.csv"
+  status_changes_csv: "output/zhubei_591_status_changes.csv"
+  top_candidates_csv: "output/zhubei_591_top_candidates.csv"
+  report_html: "output/zhubei_591_report.html"
+  # 舊版 CSV 工具輸出
+  all_csv: "output/zhubei_591_all.csv"
+  scored_csv: "output/zhubei_591_scored.csv"
+  filtered_csv: "output/zhubei_591_filtered.csv"
+  top_xlsx: "output/zhubei_591_top_candidates.xlsx"

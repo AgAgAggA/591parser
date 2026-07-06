@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# 執行產物（docs/ 是發布目錄，要進版控）
+output/
+logs/
+raw_pages/
+data/
+
+# 本機工具
+bin/
